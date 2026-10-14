@@ -23,6 +23,7 @@ class Unit(NamedTuple):
 MemKey = Tuple[int, int]  # (level, memory index); DRAM is (num_levels, 0)
 
 DELAY_CAP = 2**61  # largest compute port modeled; CP-SAT needs bounds <= int64max / 2
+ENERGY_CAP = 2**61  # bound on modeled energy, for the same reason (split over memories)
 
 class Problem(NamedTuple):
     '''Parsed inputs plus derived structure, shared by model and evaluator.'''
@@ -203,6 +204,16 @@ def evaluate_schedule(p:Problem, order, factors, par_rows):
         rd, wr = p.endpoints(u)
         reads[rd] += traffic[u] if u.op == p.output else traffic[u] // mc
         writes[wr] += traffic[u] // mc if u.op == p.output else traffic[u]
+        if u.op == p.output:
+            # partial-sum fills: every parent write but an element's first
+            # (per copy of the parent) is later read back into u's memory;
+            # zero unless reduction loops sit outside u's slot
+            first = (prod(eff[d][b] for b in range(len(order) + 1) for d in p.operand_dims[u.op])
+                     * shared(u.op, p.unit_src[u][0], num_levels))
+            fill = traffic[u] // mc - first
+            assert fill >= 0, (u, fill)
+            reads[wr] += fill
+            writes[rd] += fill
     for lvl, mems in enumerate(p.memories):
         for mem in mems:
             assert sum(spatial[Unit(op, lvl)] for op in mem.ops) <= mem.cap, ('over capacity', lvl, mem)
@@ -340,7 +351,8 @@ def cb_einsum_ml(
     linearization_level = None,
     redundant_bounds = False,
     sparse_domains = False,
-    merge_dims = False
+    merge_dims = False,
+    partial_sums = False
 ):
     '''
     Multi-level constrained-buckets model for a single einsum: chooses tiling
@@ -395,6 +407,11 @@ def cb_einsum_ml(
     - sparse_domains: give temporal factors only the values an optimum can
       take (divisors under perfect_division, else ceil(size/k)), and
       parallel factors divisors under perfect_division.
+    - partial_sums: allow temporal reduction loops outside the output's
+      slots (partial-sum spilling). Each output transfer except an
+      element's first (per copy of the parent) then also reads the partial
+      sum back from the parent: a parent read and a write to the output's
+      memory. Off: such loops are forbidden.
     - merge_dims: under perfect_division, solve with each group of dims
       that appear in the same operands merged into one dim (costs depend
       only on their product per bucket), then split the schedule back. The
@@ -403,7 +420,8 @@ def cb_einsum_ml(
 
     Cost model: traffic of unit (op, l) moves data between level l and its
     parent (next level up holding op, or DRAM): inputs are read from the
-    parent and written to l, the output the reverse. Energy is the sum of
+    parent and written to l, the output the reverse (plus, with
+    partial_sums, the fills read back from the parent). Energy is the sum of
     read_energy + write_energy over every access. Delay is the busiest port:
     every memory has separate read and write ports running in parallel,
     each busy for elements x its time, split over the memory's instances.
@@ -577,10 +595,11 @@ def cb_einsum_ml(
                     if b < num_slots and dim not in operand_dims[u.op]:
                         model.Add(factor_vars[dim][b] == 1).OnlyEnforceIf(placement_vars[u][b])
 
-            # forbid temporal reduction (no partial spilling); innermost output
-            # slot is the deepest, so this implies the rule for all levels.
-            # An output in no memory accumulates in DRAM, so no rule applies.
-            if dim in reduction_dims and p.op_levels[output_operand]:
+            # unless partial_sums, forbid temporal reduction (no partial
+            # spilling); innermost output slot is the deepest, so this implies
+            # the rule for all levels. An output in no memory accumulates in
+            # DRAM, so no rule applies.
+            if not partial_sums and dim in reduction_dims and p.op_levels[output_operand]:
                 model.Add(factor_vars[dim][b] == 1).OnlyEnforceIf(
                     inner_vars[Unit(output_operand, p.op_levels[output_operand][0])][b].Not()
                 )
@@ -682,6 +701,24 @@ def cb_einsum_ml(
         if u.op == output_operand:
             reads[rd].append(traffic_vars[u])
             writes[wr].append(parent_traffic[u])
+            if partial_sums:
+                # Fills: each parent write but an element's first is read back
+                # into u's memory. First visits are the padded output times
+                # the reduction parallelism at or above the parent (each
+                # parent copy starts from zero); without spilling they equal
+                # parent_traffic, so fills are zero.
+                if perfect_division:
+                    padded = op_size[output_operand]
+                else:
+                    padded = add_mul_chain(model, sp_prods[output_operand], 1, max_iters,
+                                           'padded_'+output_operand)
+                above = shared_factor_vars(u.op, p.unit_src[u][0], num_levels)
+                first = (add_mul_chain(model, [padded] + above, 1, max_iters, 'first_'+name[u])
+                         if above else padded)
+                fill = model.NewIntVar(0, max_iters, 'fill_'+name[u])
+                model.Add(fill == parent_traffic[u] - first)
+                reads[wr].append(fill)
+                writes[rd].append(fill)
         else:
             reads[rd].append(parent_traffic[u])
             writes[wr].append(traffic_vars[u])
@@ -710,14 +747,27 @@ def cb_einsum_ml(
             else:
                 reads[key].append(accesses)
 
-    # Energy: every access to every memory, plus the compute itself
-    energy_ub = max(1, sum(p.mem_costs[k].read_energy * len(reads[k])
-                           + p.mem_costs[k].write_energy * len(writes[k]) for k in p.mem_costs)
-                    * max_iters + compute_energy * max_iters)
+    # Energy: every access to every memory, plus the compute itself. Each
+    # memory's share is its own variable, bounded as if every transfer moved
+    # max_iters elements; that is far above any real schedule and, summed
+    # over memories (or within one constraint), can exceed CP-SAT's
+    # int64max / 2, so each share is capped at ENERGY_CAP / (number of
+    # memories), which bounds the total by ENERGY_CAP (checked after solving).
+    part_cap = ENERGY_CAP // len(p.mem_costs)
+    energy_capped = False
+    energy_parts, parts_ub = [], 0
+    for k, costs in p.mem_costs.items():
+        part_ub = (costs.read_energy * len(reads[k]) + costs.write_energy * len(writes[k])) * max_iters
+        if part_ub == 0:
+            continue
+        energy_capped |= part_ub > part_cap
+        part = model.NewIntVar(0, min(part_ub, part_cap), 'energy_'+p.label(k))
+        parts_ub += min(part_ub, part_cap)
+        model.Add(part == costs.read_energy * sum(reads[k]) + costs.write_energy * sum(writes[k]))
+        energy_parts.append(part)
+    energy_ub = max(1, parts_ub + compute_energy * max_iters)
     energy = model.NewIntVar(0, energy_ub, 'energy')
-    model.Add(energy == sum(p.mem_costs[k].read_energy * sum(reads[k])
-                            + p.mem_costs[k].write_energy * sum(writes[k]) for k in p.mem_costs)
-              + compute_energy * max_iters)
+    model.Add(energy == sum(energy_parts) + compute_energy * max_iters)
 
     # Delay: each memory's read and write ports work in parallel with all
     # other ports; delay is the busiest port. Replicated memories split
@@ -858,6 +908,14 @@ def cb_einsum_ml(
             or (objective == 'edp' and obj_val <= excluded_delay * compute_energy * max_iters)):
         warnings.warn('DELAY_CAP may have excluded a better schedule (compute port capped at '
                       + str(excluded_delay - compute_time) + ')')
+    # schedules cut off by ENERGY_CAP have one memory's energy, so the total,
+    # above part_cap, and delay at least the compute port with every compute
+    # unit busy
+    delay_lb = compute_time * -(-max_iters // total_fan)
+    if energy_capped and not (
+            objective == 'energy'
+            or (objective == 'edp' and obj_val <= (part_cap + 1) * delay_lb)):
+        warnings.warn('ENERGY_CAP may have excluded a better schedule')
     if verbose:
         print('Energy:', e_val, 'Delay:', d_val, 'EDP:', e_val * d_val)
 
@@ -869,18 +927,20 @@ if __name__ == '__main__':
     # cb_einsum_ml(mm, 'C', {'m': 4096, 'k': 65536, 'n': 4096}, [4096, 524288], objective='energy')
     # cb_einsum_ml(mm, 'C', {'m': 4096, 'k': 65536, 'n': 4096}, [4096, 524288], objective='energy', blocked=True)
 
-    # Q einsum from TCM paper
+    # Q einsum from TCM paper. TPU-v4i costs, 8 bits per element; energy
+    # unit one MAC (0.084 pJ), time unit 1 / (3 * 2048e9) s (a third of a
+    # GlobalBuffer element read). See ../comparison/run_cpsat.py.
     cb_einsum_ml(
         {'I': ('b', 'm', 'd'), 'WQ': ('h', 'e', 'd'), 'Q': ('b', 'm', 'h', 'e')},
         'Q',
         {'b': 64, 'm': 64 * 1024, 'h': 32, 'e': 128, 'd': 4096},
         [[(1, ('WQ',))], [(4 * 1024 * 1024, ('I', 'Q'))], 128 * 1024 * 1024],
-        level_costs=[MemCosts(0, 0, 0, 0), MemCosts(read_energy=3, write_energy=3, read_time=0, write_time=0), MemCosts(read_energy=22, write_energy=28, read_time=1, write_time=2)],
-        dram_costs=MemCosts(83, 83, 3, 3),
+        level_costs=[MemCosts(0, 0, 0, 0), MemCosts(read_energy=24, write_energy=28, read_time=0, write_time=0), MemCosts(read_energy=179, write_energy=225, read_time=3, write_time=6)],
+        dram_costs=MemCosts(670, 670, 10, 10),
         objective='edp',
         fanouts=[(128, 128), 4, 1],
         multicast=[(('I',), ('Q',)), ('I', 'WQ'), False],
-        compute_time=8 * 2048,
+        compute_time=5851,
         compute_energy=1,
         perfect_division=True
     )

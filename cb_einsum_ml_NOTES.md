@@ -33,6 +33,13 @@ A CP-SAT model that finds the tiling, loop order, parallelism and memory placeme
   - Output: partial sums are reduced on the way to the parent.
   - Allowed parallel dims per array dimension: reduction dims if the output is multicast there; output dims if an input is multicast there or nothing is. `True` is the same as listing every operand.
 - **Placement rules.** Two rules restrict where factors go: the optimal-placement rules, and "no temporal reduction outside the output's innermost slot" (no partial spilling).
+- **Partial sums (`partial_sums=True`).** This drops the no-spilling rule and charges fills instead.
+  - For each output unit, fills = `parent_traffic − first visits`. First visits are the padded output size times the reduction parallelism at or above the parent, since each parent copy starts from zero.
+  - Each fill is one parent read and one write into the unit's memory. Compute's read-modify-write needs no change.
+  - `evaluate_schedule` always charges fills. They are exactly zero for schedules that obey the rule.
+  - On TCM's AV schedule, the read and write counts at every memory match AccelForge's (`../comparison/check_partial_sums.py`).
+  - With it on, AV's optimum improves by 1.07% in AccelForge, matching TCM's. The other GPT-3 einsums are unchanged.
+  - The search space is larger: without the fast options, V, K and Q stop FEASIBLE at 120 s, and Z takes about 100 s. With `redundant_bounds`, `sparse_domains` and `merge_dims`, all eight solve OPTIMAL in under 0.5 s.
   - A tie-break orders adjacent slots that have only empty buckets between them.
   - These rules act only on temporal factors (`factor_vars`), never on parallel ones.
 
@@ -48,13 +55,15 @@ These use `mm = {'A': ('m','k'), 'B': ('k','n'), 'C': ('m','n')}` with `{'m': 40
 
 ## Performance ideas, in suggested order
 Items 1–4 are implemented as opt-in arguments, all off by default: `seed`, `num_workers`, `linearization_level`, `redundant_bounds`, `sparse_domains` and `merge_dims`. The benchmark ran the eight GPT-3 6.7B einsums with the `__main__` TPU-v4i parameters on 16 cores, taking the median of 3 seeds; see `../comparison/results/bench_cpsat.md`. Every run reached OPTIMAL. The summed CP-SAT walltime was:
-- 25.0 s for the baseline;
-- 23.3 s with `linearization_level=2`, which is within noise;
-- 17.5 s with `redundant_bounds`;
-- 6.5 s with `sparse_domains`;
-- 2.2 s with `merge_dims`;
-- 0.41 s with `redundant_bounds`, `sparse_domains` and `merge_dims` together, about 0.05 s per einsum;
-- 0.42 s with all four.
+- 22.7 s for the baseline;
+- 25.2 s with `linearization_level=2`, so no gain;
+- 19.3 s with `redundant_bounds`;
+- 7.0 s with `sparse_domains`;
+- 2.3 s with `merge_dims`;
+- 0.52 s with `redundant_bounds`, `sparse_domains` and `merge_dims` together, about 0.06 s per einsum;
+- 0.50 s with all four.
+
+These numbers use the rescaled costs of 2026-10-09; see `../HANDOFF.md`.
 
 No run changed the optimum. The matmul regression values below still hold with the options on, though that tiny padded case is slightly slower with them (0.28 s vs. 0.21 s).
 
@@ -65,6 +74,7 @@ How `merge_dims` works:
 - With `verbose` on, it prints both the merged loop nest and the split one.
 
 The compute port's bound is capped at `DELAY_CAP = 2**61`, because einsums with 2^48 or more iterations otherwise exceed CP-SAT's int64max / 2 limit. A warning fires if the cap could have excluded a better schedule.
+- Energy is split into one variable per memory, each capped at `ENERGY_CAP / (number of memories)`, with `ENERGY_CAP = 2**61`. This is needed because with the rescaled costs, the bound on QK's and AV's energy expression exceeds the int64max / 2 limit CP-SAT enforces per linear constraint. A warning fires if the cap could have excluded a better schedule.
 
 Benchmark each change on its own against `__main__`. Record time-to-OPTIMAL, or the final gap between the objective and `BestObjectiveBound()` at a fixed time limit. You can capture both by wrapping `cp_model.CpSolver.Solve` with a solution callback; that's how the original comparisons were done.
 
