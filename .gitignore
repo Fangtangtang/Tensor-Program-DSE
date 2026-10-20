@@ -1,2 +1,5 @@
 llvm-project/
 .venv/
+
+**__pycache__
+/exp/plots/
